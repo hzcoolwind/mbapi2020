@@ -14,6 +14,8 @@ import math
 
 from .const import (
     JSON_EXPORT_IGNORED_KEYS,
+    LOGIN_APP_ID_CN,
+    LOGIN_APP_ID_EU,
     LOGIN_BASE_URI,
     LOGIN_BASE_URI_CN,
     PSAG_BASE_URI,
@@ -125,6 +127,14 @@ class UrlHelper:
                 return PSAG_BASE_URI_CN
             case _:
                 return PSAG_BASE_URI
+
+    @staticmethod
+    def Login_App_Id(region: str) -> str:
+        match region:
+            case current if current == REGION_CHINA:
+                return LOGIN_APP_ID_CN
+            case _:
+                return LOGIN_APP_ID_EU
 
     @staticmethod
     def Login_Base_Url(region: str) -> str:
@@ -282,8 +292,8 @@ class Watchdog:
 
     async def trigger(self):
         """Trigger the watchdog."""
-        # if self._log_events:
-        #     LOGGER.debug("%s Watchdog trigger", self._topic)
+        if self._log_events:
+            LOGGER.debug("%s Watchdog trigger", self._topic)
         if self._timer_task:
             self._timer_task.cancel()
 

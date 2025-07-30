@@ -104,7 +104,6 @@ ELECTRIC_OPTIONS = [
     "chargeCouplerDCStatus",
     "chargeCouplerACLockStatus",
     "chargeCouplerDCLockStatus",
-    "chargePrograms",
     "chargingactive",
     "chargingBreakClockTimer",
     "chargingstatus",
@@ -118,7 +117,6 @@ ELECTRIC_OPTIONS = [
     "electricconsumptionstart",
     "electricconsumptionreset",
     "electricRatioStart",
-    "electricRatioReset",
     "electricRatioOverall",
     "endofchargetime",
     "endofChargeTimeWeekday",
@@ -209,11 +207,16 @@ GeofenceEvents_OPTIONS = ["last_event_zone", "last_event_timestamp", "last_event
 class Car:
     """Car class, stores the car values at runtime."""
 
+    baumuster_description: str = ""
+    features: dict[str, bool]
+    geofence_events: GeofenceEvents
+    geo_fencing_retry_counter: int = 0
+    has_geofencing: bool = True
+    vehicle_information: dict = {}
+
     def __init__(self, vin: str):
         """Initialize the Car instance."""
         self.finorvin = vin
-        self.vehicle_information: dict = {}
-        self.capabilities: dict[str, Any] = {}
 
         self.licenseplate = ""
         self._is_owner = False
@@ -241,16 +244,10 @@ class Car:
         self.geofence_events = GeofenceEvents()
         self.features = {}
         self.masterdata: dict[str, Any] = {}
-        self.app_configuration: dict[str, Any] = {}
         self.entry_setup_complete = False
-        self._update_listeners = set()
-        self.baumuster_description: str = ""
-        self.features: dict[str, bool]
-        self.geofence_events: GeofenceEvents
-        self.geo_fencing_retry_counter: int = 0
-        self.has_geofencing: bool = True
         self._data_collection_mode: str = "push"
         self._data_collection_mode_ts: float = 0
+        self._update_listeners = set()
 
     @property
     def is_owner(self):
@@ -284,16 +281,6 @@ class Car:
         self._last_message_received = value
 
     @property
-    def data_collection_mode(self):
-        """Get/Set last message received."""
-        return CarAttribute(self._data_collection_mode, "VALID", self._data_collection_mode_ts)
-
-    @data_collection_mode.setter
-    def data_collection_mode(self, value):
-        self._data_collection_mode = value
-        self._data_collection_mode_ts = datetime.now().timestamp()
-
-    @property
     def last_command_type(self):
         """Get/Set last command type."""
         return CarAttribute(self._last_command_type, "VALID", self.last_command_time_stamp)
@@ -312,6 +299,16 @@ class Car:
         self._last_command_state = value
 
     @property
+    def data_collection_mode(self):
+        """Get/Set data collection mode."""
+        return CarAttribute(self._data_collection_mode, "VALID", self._data_collection_mode_ts)
+
+    @data_collection_mode.setter
+    def data_collection_mode(self, value):
+        self._data_collection_mode = value
+        self._data_collection_mode_ts = datetime.now().timestamp()
+
+    @property
     def last_command_error_code(self):
         """Get/Set last command error code."""
         return CarAttribute(self._last_command_error_code, "VALID", self.last_command_time_stamp)
@@ -328,6 +325,16 @@ class Car:
     @last_command_error_message.setter
     def last_command_error_message(self, value):
         self._last_command_error_message = value
+
+    @property
+    def data_collection_mode(self):
+        """Get/Set data collection mode."""
+        return CarAttribute(self._data_collection_mode, "VALID", self._data_collection_mode_ts)
+
+    @data_collection_mode.setter
+    def data_collection_mode(self, value):
+        self._data_collection_mode = value
+        self._data_collection_mode_ts = datetime.now().timestamp()
 
     def add_update_listener(self, listener):
         """Add a listener for update notifications."""
@@ -446,10 +453,7 @@ class GeofenceEvents:
     last_event_timestamp: CarAttribute | None = None
     last_event_zone: CarAttribute | None = None
     name: str = "GeofenceEvents"
-
-    def __post_init__(self):
-        """Initialize mutable attributes."""
-        self.events = []
+    events = []
 
 
 @dataclass(init=False)

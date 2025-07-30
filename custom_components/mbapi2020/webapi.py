@@ -25,6 +25,7 @@ from .const import (
     WEBSOCKET_USER_AGENT,
     WEBSOCKET_USER_AGENT_CN,
     X_APPLICATIONNAME,
+    X_APPLICATIONNAME_CN,
 )
 from .helper import UrlHelper as helper
 from .oauth import Oauth
@@ -35,6 +36,8 @@ LOGGER = logging.getLogger(__name__)
 
 class WebApi:
     """Define the API object."""
+
+    ssl_context: ssl.SSLContext | bool = VERIFY_SSL
 
     def __init__(
         self,
@@ -50,6 +53,9 @@ class WebApi:
         self.hass = hass
         self.session_id = str(uuid.uuid4()).upper()
 
+        if isinstance(VERIFY_SSL, str):
+            self.ssl_context = ssl.create_default_context(cafile=VERIFY_SSL)
+
     async def _request(
         self,
         method: str,
@@ -64,6 +70,7 @@ class WebApi:
         url = f"{helper.Rest_url(self._region)}{endpoint}"
         kwargs.setdefault("headers", {})
         kwargs.setdefault("proxy", SYSTEM_PROXY)
+        kwargs.setdefault("ssl", self.ssl_context)
 
         token = await self._oauth.async_get_cached_token()
 
@@ -72,13 +79,13 @@ class WebApi:
                 "Authorization": f"Bearer {token['access_token']}",
                 "X-SessionId": self.session_id,
                 "X-TrackingId": str(uuid.uuid4()).upper(),
-                "X-ApplicationName": X_APPLICATIONNAME,
+                "X-ApplicationName": X_APPLICATIONNAME_CN if self._region == REGION_CHINA else X_APPLICATIONNAME,
                 "ris-application-version": RIS_APPLICATION_VERSION,
                 "ris-os-name": "ios",
                 "ris-os-version": RIS_OS_VERSION,
                 "ris-sdk-version": RIS_SDK_VERSION,
-                "X-Locale": "de-DE",
-                "User-Agent": WEBSOCKET_USER_AGENT,
+                "X-Locale": "zh-CN" if self._region == REGION_CHINA else "de-DE",
+                "User-Agent": WEBSOCKET_USER_AGENT_CN if self._region == REGION_CHINA else WEBSOCKET_USER_AGENT,
                 "Content-Type": "application/json; charset=UTF-8",
             }
         else:
@@ -106,7 +113,7 @@ class WebApi:
                             error = await resp.text()
                             error_json = json.loads(error)
                             if error_json:
-                                error_message = f"Error requesting: {url} - {resp.status} -  {error_json['code']} - {error_json['errors']}"
+                                error_message = f'Error requesting: {url} - {resp.status} -  {error_json["code"]} - {error_json["errors"]}'
                             else:
                                 error_message = f"Error requesting: {url} - {resp.status} - 0 - {error}"
                         except (json.JSONDecodeError, KeyError):
@@ -129,10 +136,6 @@ class WebApi:
             return []
         except Exception:
             LOGGER.debug(traceback.format_exc())
-
-    async def get_config(self):
-        """Get standard user information."""
-        return await self._request("get", "/v1/config")
 
     async def get_user(self):
         """Get standard user information."""
@@ -195,12 +198,49 @@ class WebApi:
     async def get_car_geofencing_violations(self, vin: str):
         """Get all geofencing violations for a car."""
         url = f"/v1/geofencing/vehicles/{vin}/fences/violations"
-        return await self._request("get", url, rcp_headers=False, ignore_errors=True)
-
-    async def get_fleet_info(self, company: str, fleet: str):
-        """Get fleet information."""
-        url = f"/v1/company/{company}/fleet/{fleet}?size=100&filter="
-        return await self._request("get", url, rcp_headers=False, ignore_errors=True)
+        
+        # Build the full URL and headers using existing infrastructure
+        full_url = f"{helper.Rest_url(self._region)}{url}"
+        
+        kwargs = {
+            "proxy": SYSTEM_PROXY,
+            "ssl": self.ssl_context,
+        }
+        
+        token = await self._oauth.async_get_cached_token()
+        kwargs["headers"] = {
+            "Authorization": f"Bearer {token['access_token']}",
+            "User-Agent": WEBSOCKET_USER_AGENT if self._region != REGION_CHINA else WEBSOCKET_USER_AGENT_CN,
+            "X-ApplicationName": X_APPLICATIONNAME  if self._region != REGION_CHINA else X_APPLICATIONNAME_CN,
+            "X-SessionId": self.session_id,
+            "X-TrackingId": str(uuid.uuid4()).upper(),
+            "ris-application-version": RIS_APPLICATION_VERSION,
+            "ris-os-name": "ios",
+            "ris-os-version": RIS_OS_VERSION,
+            "ris-sdk-version": RIS_SDK_VERSION,
+            "X-Locale": "zh-CN",
+            "Content-Type": "application/json; charset=UTF-8",
+        }
+        
+        try:
+            async with self._session.request("get", full_url, **kwargs) as resp:
+                if resp.status == 403:
+                    # 403 means geofencing is not available for this vehicle/region
+                    LOGGER.debug("Geofencing not available for vehicle %s (403 Forbidden)", vin[-7:])
+                    return None, 403
+                elif 400 <= resp.status < 500:
+                    error = await resp.text()
+                    LOGGER.info("Error requesting: %s - %s - %s", url, resp.status, error)
+                    return None, resp.status
+                else:
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+                    LOGGER.debug("Geofencing available for vehicle %s.", vin[-7:])
+                    return data, 200
+                    
+        except ClientError as err:
+            LOGGER.debug("Geofencing API error for %s: %s", vin[-7:], err)
+            return None, 0
 
     async def is_car_rcp_supported(self, vin: str, **kwargs):
         """Return if is car rcp supported."""
@@ -212,6 +252,7 @@ class WebApi:
 
         kwargs.setdefault("headers", headers)
         kwargs.setdefault("proxy", SYSTEM_PROXY)
+        kwargs.setdefault("ssl", self.ssl_context)
 
         url = f"{helper.PSAG_url(self._region)}/api/app/v2/vehicles/{vin}/profileInformation"
 
@@ -231,13 +272,14 @@ class WebApi:
     async def get_car_p2b_data_via_rest(self, vin: str):
         """Get vehicleattributes via rest."""
         url = f"{helper.Widget_url(self._region)}/v1/vehicle/{vin}/vehicleattributes"
-
         try:
             data = await self._request("get", "", url=url, return_as_json=False)
             message = vehicle_events_pb2.VEPUpdate()
             message.ParseFromString(data)
         except TypeError as err:
             LOGGER.error("could not decode data (%s) from websocket: %s", data, err)
+            return None
         except google.protobuf.message.DecodeError as err:
             LOGGER.error("could not decode data (%s) from websocket: %s", data, err)
+            return None
         return message if message else None

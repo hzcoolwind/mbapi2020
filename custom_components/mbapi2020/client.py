@@ -18,7 +18,6 @@ from custom_components.mbapi2020.proto import client_pb2
 import custom_components.mbapi2020.proto.vehicle_commands_pb2 as pb2_commands
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ServiceValidationError
 from homeassistant.helpers import system_info
 
 from .car import (
@@ -260,14 +259,14 @@ class Client:
         self._on_dataload_complete = callback_dataload_complete
         await self.websocket.async_connect(self.on_data)
 
-    def _build_car(self, received_car_data, update_mode):
+    def _build_car(self, received_car_data, update_mode, is_rest_data=False):
         if received_car_data.get("vin") in self.excluded_cars:
             LOGGER.debug("CAR excluded: %s", loghelper.Mask_VIN(received_car_data.get("vin")))
             return
 
         if received_car_data.get("vin") not in self.cars:
             LOGGER.info(
-                "Flow Problem - VepUpdate for unknown car: %s",
+                "Flow Problem - VepUpdate for unknown car. Looks like we found a Smart: %s",
                 loghelper.Mask_VIN(received_car_data.get("vin")),
             )
 
@@ -279,6 +278,12 @@ class Client:
 
         car.messages_received.update("p" if update_mode else "f")
         car.last_message_received = int(round(time.time() * 1000))
+        
+        # Set data collection mode based on data source
+        if is_rest_data:
+            car.data_collection_mode = "pull"
+        else:
+            car.data_collection_mode = "push"
 
         if not update_mode:
             car.last_full_message = received_car_data
@@ -338,6 +343,11 @@ class Client:
             WINDOW_OPTIONS,
             update_mode,
         )
+        
+        # For REST data, create synthetic windowStatusOverall if missing
+        if is_rest_data and received_car_data.get("attributes"):
+            if "windowStatusOverall" not in received_car_data["attributes"]:
+                self._create_synthetic_window_status_overall(received_car_data, car.finorvin)
 
         car.electric = self._get_car_values(
             received_car_data,
@@ -381,7 +391,6 @@ class Client:
         # Define handlers for specific options and the generic case
         option_handlers = {
             "max_soc": self._get_car_values_handle_max_soc,
-            "chargePrograms": self._get_car_values_handle_chargePrograms,
             "chargingBreakClockTimer": self._get_car_values_handle_charging_break_clock_timer,
             "ignitionstate": self._get_car_values_handle_ignitionstate,
             "precondStatus": self._get_car_values_handle_precond_status,
@@ -486,28 +495,6 @@ class Client:
 
         return None
 
-    def _get_car_values_handle_chargePrograms(self, car_detail, class_instance, option, update):
-        attributes = car_detail.get("attributes", {})
-        curr = attributes.get(option)
-        if not curr:
-            return None
-
-        charge_programs_value = curr.get("charge_programs_value", {})
-        value = charge_programs_value.get("charge_program_parameters", [])
-        if not value:
-            return None
-
-        status = curr.get("status", "VALID")
-        time_stamp = curr.get("timestamp", 0)
-
-        return CarAttribute(
-            value=value,
-            retrievalstatus=status,
-            timestamp=time_stamp,
-            display_value=None,
-            unit=None,
-        )
-
     def _get_car_values_handle_charging_break_clock_timer(self, car_detail, class_instance, option, update):
         attributes = car_detail.get("attributes", {})
         curr = attributes.get(option)
@@ -535,9 +522,8 @@ class Client:
         value = self._get_car_values_handle_generic(car_detail, class_instance, option, update)
         if value:
             vin = car_detail.get("vin")
+
             self.ignition_states[vin] = value.value == "4"
-            if vin in self.excluded_cars:
-                self.ignition_states[vin] = False
 
         return value
 
@@ -610,55 +596,6 @@ class Client:
             default_value,
         )
 
-    def _process_rest_vep_update(self, data):
-        LOGGER.debug("Start _process_rest_vep_update")
-
-        self._write_debug_output(data, "rfu")
-        # Don't understand the protobuf dict errors --> convert to json
-        vep_json = json.loads(MessageToJson(data, preserving_proto_field_name=True))
-        vin = vep_json.get("vin", None)
-        if not vin:
-            LOGGER.debug("No VIN found in VEPUpdate data: %s", vep_json)
-            return
-
-        if not self._first_vepupdates_processed:
-            self._vepupdates_time_first_message = datetime.now()
-            self._first_vepupdates_processed = True
-
-        self._build_car(vep_json, update_mode=False)
-
-        if self._dataload_complete_fired:
-            current_car = self.cars.get(vin)
-            current_car.data_collection_mode = "pull"
-
-            if current_car:
-                current_car.publish_updates()
-
-        if not self._dataload_complete_fired:
-            fire_complete_event: bool = True
-            for car in self.cars.values():
-                if not car.entry_setup_complete:
-                    fire_complete_event = False
-                LOGGER.debug(
-                    "_process_vep_updates - %s - complete: %s - %s",
-                    loghelper.Mask_VIN(car.finorvin),
-                    car.entry_setup_complete,
-                    car.messages_received,
-                )
-            if fire_complete_event:
-                LOGGER.debug("_process_vep_updates - all completed - fire event: _on_dataload_complete")
-                self._hass.async_create_task(self._on_dataload_complete())
-                self._dataload_complete_fired = True
-
-        if not self._dataload_complete_fired and (datetime.now() - self._vepupdates_time_first_message) > timedelta(
-            seconds=self._vepupdates_timeout_seconds
-        ):
-            LOGGER.debug(
-                "_process_vep_updates - not all data received, timeout reached - fire event: _on_dataload_complete"
-            )
-            self._hass.async_create_task(self._on_dataload_complete())
-            self._dataload_complete_fired = True
-
     def _process_vep_updates(self, data):
         LOGGER.debug("Start _process_vep_updates")
 
@@ -703,7 +640,6 @@ class Client:
 
             if self._dataload_complete_fired:
                 current_car = self.cars.get(vin)
-                current_car.data_collection_mode = "push"
 
                 if current_car:
                     current_car.publish_updates()
@@ -732,6 +668,126 @@ class Client:
             )
             self._hass.async_create_task(self._on_dataload_complete())
             self._dataload_complete_fired = True
+
+    def _process_rest_vep_update(self, data):
+        """Process REST-based VEP update for WebSocket blocking fallback."""
+        LOGGER.debug("Start _process_rest_vep_update")
+        self._write_debug_output(data, "rfu")
+        
+        # Don't understand the protobuf dict errors --> convert to json
+        vep_json = json.loads(MessageToJson(data, preserving_proto_field_name=True))
+        
+        # Check if this is a nested vepUpdates structure or a direct VIN structure
+        if "vepUpdates" in vep_json and "updates" in vep_json["vepUpdates"]:
+            # This is a multi-car update structure
+            cars = vep_json["vepUpdates"]["updates"]
+            for vin in cars:
+                if vin in self.excluded_cars:
+                    continue
+                current_car = cars.get(vin)
+                if current_car:
+                    self._build_car(current_car, update_mode=False, is_rest_data=True)
+        else:
+            # This is a single car structure
+            vin = vep_json.get("vin", None)
+            if not vin:
+                LOGGER.debug("No VIN found in VEPUpdate data: %s", vep_json)
+                return
+            self._build_car(vep_json, update_mode=False, is_rest_data=True)
+            
+        if not self._first_vepupdates_processed:
+            self._vepupdates_time_first_message = datetime.now()
+            self._first_vepupdates_processed = True
+
+        if self._dataload_complete_fired:
+            # Update all processed cars
+            for car in self.cars.values():
+                if car.data_collection_mode.value == "pull":
+                    car.publish_updates()
+                
+        if not self._dataload_complete_fired:
+            fire_complete_event: bool = True
+            for car in self.cars.values():
+                if not car.entry_setup_complete:
+                    fire_complete_event = False
+                LOGGER.debug(
+                    "_process_rest_vep_update - %s - complete: %s - %s",
+                    loghelper.Mask_VIN(car.finorvin),
+                    car.entry_setup_complete,
+                    car.messages_received,
+                )
+            if fire_complete_event:
+                LOGGER.debug("_process_rest_vep_update - all completed - fire event: _on_dataload_complete")
+                self._hass.async_create_task(self._on_dataload_complete())
+                self._dataload_complete_fired = True
+
+    def _create_synthetic_window_status_overall(self, car_data, vin):
+        """Create a synthetic windowStatusOverall based on individual window statuses for REST data."""
+        if not car_data.get("attributes"):
+            return
+            
+        # Debug: Log all available window-related attributes
+        # window_attrs_found = [key for key in car_data["attributes"].keys() if "window" in key.lower()]
+        # if window_attrs_found:
+        #     LOGGER.debug("Available window attributes for %s: %s", loghelper.Mask_VIN(vin), window_attrs_found)
+        # else:
+        #     LOGGER.debug("No window attributes found in REST data for %s", loghelper.Mask_VIN(vin))
+            
+        # Define main window status attributes to check
+        main_window_attrs = [
+            "windowstatusfrontleft", "windowstatusfrontright",
+            "windowstatusrearleft", "windowstatusrearright"
+        ]
+        
+        # Check individual window statuses
+        window_statuses = []
+        latest_timestamp = 0
+        
+        for attr_name in main_window_attrs:
+            if attr_name in car_data["attributes"]:
+                attr_data = car_data["attributes"][attr_name]
+                value = attr_data.get("int_value", 0)
+                timestamp = attr_data.get("timestamp", 0)
+                
+                # Convert timestamp to int for comparison
+                try:
+                    timestamp = int(timestamp) if timestamp else 0
+                    latest_timestamp = max(latest_timestamp, timestamp)
+                except (ValueError, TypeError):
+                    pass
+                
+                # Add to window statuses if value is available
+                if value is not None:
+                    window_statuses.append(value)
+        
+        # Calculate overall status based on individual windows
+        # If we have valid window statuses, determine overall state
+        if window_statuses:
+            # Assume "CLOSED" = 0, "OPEN" = 1 or similar numeric values
+            # If all windows are closed (0), overall should be "CLOSED"
+            # If any window is open (>0), overall should be "OPEN"
+            try:
+                numeric_statuses = [int(status) for status in window_statuses if status is not None]
+                if numeric_statuses:
+                    overall_value = "OPEN" if any(status > 0 for status in numeric_statuses) else "CLOSED"
+                else:
+                    overall_value = "CLOSED"  # Default to closed if no valid data
+            except (ValueError, TypeError):
+                # If values are not numeric, try string comparison
+                overall_value = "OPEN" if any(str(status).upper() in ["OPEN", "1", "TRUE"] for status in window_statuses) else "CLOSED"
+        else:
+            # No individual window data available, default to CLOSED
+            overall_value = "CLOSED"
+        
+        # Create the synthetic windowStatusOverall attribute
+        car_data["attributes"]["windowStatusOverall"] = {
+            "value": overall_value,
+            "timestamp": str(latest_timestamp) if latest_timestamp > 0 else "0",
+            "status": 4  # Use same status as other synthetic attributes
+        }
+
+        LOGGER.debug("Created synthetic windowStatusOverall for %s: %s (based on %d individual windows)", 
+                      loghelper.Mask_VIN(vin), overall_value, len(window_statuses))
 
     def _process_assigned_vehicles(self, data):
         if not self._dataload_complete_fired:
@@ -817,12 +873,14 @@ class Client:
 
                                 current_car.publish_updates()
 
-    async def charge_program_configure(self, vin: str, program: int, max_soc: None | int = None) -> None:
+    async def charge_program_configure(self, vin: str, program: int):
         """Send the selected charge program to the car."""
         if not self._is_car_feature_available(vin, "CHARGE_PROGRAM_CONFIGURE"):
-            raise ServiceValidationError(
-                "Can't set the charge program. Feature CHARGE_PROGRAM_CONFIGURE not availabe for this car."
+            LOGGER.warning(
+                "Can't set the charge program of the  car %s. Feature CHARGE_PROGRAM_CONFIGURE not availabe for this car.",
+                loghelper.Mask_VIN(vin),
             )
+            return
 
         LOGGER.debug("Start charge_program_configure")
         message = client_pb2.ClientMessage()
@@ -830,29 +888,10 @@ class Client:
         message.commandRequest.request_id = str(uuid.uuid4())
         charge_programm = pb2_commands.ChargeProgramConfigure()
         charge_programm.charge_program = program
-        if max_soc is not None:
-            charge_programm.max_soc.value = max_soc
-        else:
-            try:
-                current_charge_programs = getattr(self.cars.get(vin).electric, "chargePrograms", None)
-                if current_charge_programs:
-                    charge_programm.max_soc.value = current_charge_programs.value[program].get("max_soc")
-            except (KeyError, IndexError, TypeError, AttributeError) as err:
-                LOGGER.warning(
-                    "charge_program_configure - Error: %s - %s",
-                    err,
-                    self.cars.get(vin).electric.__getattribute__("chargePrograms"),
-                )
-
         message.commandRequest.charge_program_configure.CopyFrom(charge_programm)
-        LOGGER.debug(
-            "charge_program_configure - vin: %s - program: %s - max_soc: %s",
-            loghelper.Mask_VIN(vin),
-            charge_programm.charge_program,
-            charge_programm.max_soc.value,
-        )
+
         await self.execute_car_command(message)
-        LOGGER.debug("End charge_program_configure for vin %s", loghelper.Mask_VIN(vin))
+        return
 
     async def charging_break_clocktimer_configure(
         self,
@@ -1706,11 +1745,19 @@ class Client:
         if vin in self.cars:
             car = self.cars[vin]
 
-            if self.websocket and self.websocket.account_blocked:
+            # Check if WebSocket is blocked and fallback to REST polling
+            if hasattr(self, 'websocket') and hasattr(self.websocket, 'account_blocked') and self.websocket.account_blocked:
                 LOGGER.debug("start get_car_p2b_data_via_rest: %s", loghelper.Mask_VIN(vin))
-                p2b_data = await self.webapi.get_car_p2b_data_via_rest(vin)
-                self._process_rest_vep_update(p2b_data)
+                try:
+                    p2b_data = await self.webapi.get_car_p2b_data_via_rest(vin)
+                    if p2b_data:
+                        self._process_rest_vep_update(p2b_data)
+                        LOGGER.debug("Successfully updated car data via REST for %s", loghelper.Mask_VIN(vin))
+                except Exception as err:
+                    LOGGER.error("Error fetching car data via REST for %s: %s", loghelper.Mask_VIN(vin), err)
+                    # Don't return here - continue with geofencing to maintain some functionality
 
+            # Skip geofencing if it has been permanently disabled for this car
             if not car.has_geofencing:
                 return
 
@@ -1718,8 +1765,15 @@ class Client:
                 car.geofence_events = GeofenceEvents()
 
             LOGGER.debug("start get_car_geofencing_violations: %s", loghelper.Mask_VIN(vin))
-            geofencing_violotions = await self.webapi.get_car_geofencing_violations(car.finorvin)
-            if geofencing_violotions and len(geofencing_violotions) > 0:
+            
+            geofencing_violotions, status_code = await self.webapi.get_car_geofencing_violations(car.finorvin)
+            
+            if status_code == 403:
+                # 403 means geofencing is permanently not available for this vehicle/region
+                LOGGER.info("Geofencing permanently disabled for %s (403 Forbidden) - will not retry", loghelper.Mask_VIN(vin))
+                car.has_geofencing = False
+                return
+            elif geofencing_violotions and len(geofencing_violotions) > 0:
                 car.geofence_events.last_event_type = CarAttribute(
                     geofencing_violotions[-1].get("type"),
                     "VALID",

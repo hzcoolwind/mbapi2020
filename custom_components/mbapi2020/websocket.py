@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime
-import json
 import logging
 import uuid
 
@@ -38,7 +37,7 @@ from .proto import vehicle_events_pb2
 
 DEFAULT_WATCHDOG_TIMEOUT = 30
 DEFAULT_WATCHDOG_TIMEOUT_CARCOMMAND = 180
-INITIAL_WATCHDOG_TIMEOUT = 60  # 5 minutes
+INITIAL_WATCHDOG_TIMEOUT = 60  # Initial timeout
 WATCHDOG_PROTECTION_PERIOD = 10
 PING_WATCHDOG_TIMEOUT = 30
 RECONNECT_WATCHDOG_TIMEOUT = 30
@@ -73,7 +72,7 @@ class Websocket:
             log_events=True,
         )
         self._pingwatchdog: Watchdog = Watchdog(
-            self.ping, topic="Ping", timeout_seconds=PING_WATCHDOG_TIMEOUT, log_events=False
+            self.ping, topic="Ping", timeout_seconds=PING_WATCHDOG_TIMEOUT, log_events=True
         )
         self._reconnectwatchdog: Watchdog = Watchdog(
             self._reconnect_attempt, topic="Reconnect", timeout_seconds=RECONNECT_WATCHDOG_TIMEOUT, log_events=True
@@ -112,7 +111,7 @@ class Websocket:
         if self.is_connecting:
             return
 
-        async def _async_stop_handler(event):
+        async def _async_stop_handler(_event):
             """Stop when Home Assistant is shutting down."""
             await self.async_stop()
 
@@ -141,7 +140,7 @@ class Websocket:
             # Sicherstellen, dass Tasks ordnungsgemäß beendet werden
             await self._cleanup_tasks()
 
-    async def async_stop(self, now: datetime = datetime.now()):
+    async def async_stop(self, now: datetime | None = None):
         """Close connection."""
         self.is_stopping = True
 
@@ -158,7 +157,7 @@ class Websocket:
         # Stop main watchdog after connection is closed
         self._watchdog.cancel()
         self.connection_state = "closed"
-        # Reset initial timeout state on stop - next connection will use 5min timeout again
+        # Reset initial timeout state on stop - next connection will use initial timeout again
         self._connection_start_time = None
         self._initial_timeout_used = False
 
@@ -174,11 +173,6 @@ class Websocket:
 
     async def initiatiate_connection_disconnect_with_reconnect(self):
         """Initiate a connection disconnect."""
-        # LOGGER.debug(
-        #     "ignitions_state: %s, %s",
-        #     self.oauth._config_entry.entry_id,
-        #     json.dumps(self._ignition_states),
-        # )
         if any(self._ignition_states.values()):
             LOGGER.debug(
                 "initiatiate_connection_disconnect_with_reconnect canceled - Reason: ignitions_state: %s",
@@ -194,9 +188,12 @@ class Websocket:
     async def ping(self):
         """Send a ping to the MB websocket servers."""
         try:
+            LOGGER.debug("Sending ping to websocket server")
             await self._connection.ping()
+            LOGGER.debug("Ping sent successfully, triggering ping watchdog")
             await self._pingwatchdog.trigger()
-        except (client_exceptions.ClientError, ConnectionResetError):
+        except (client_exceptions.ClientError, ConnectionResetError) as err:
+            LOGGER.debug("Ping failed with error: %s, still triggering ping watchdog", err)
             await self._pingwatchdog.trigger()
 
     async def call(self, message, car_command: bool = False):
@@ -321,27 +318,26 @@ class Websocket:
                 if "429" in str(error.code):
                     self.account_blocked = True
 
-                    if not self._relogin_429_done:
-                        config_entry = getattr(self.oauth, "_config_entry", None)
-                        if config_entry and "password" in config_entry.data:
-                            password = config_entry.data["password"]
-                            username = config_entry.data.get("username")
-                            region = config_entry.data.get("region")
-                            if username and password and hasattr(self.oauth, "async_login_new"):
-                                LOGGER.info(
-                                    "429 detected: Trying relogin with stored password for config_entry: %s",
-                                    config_entry.entry_id,
-                                )
-                                try:
-                                    token_info = await self.oauth.async_login_new(username, password)
-                                    LOGGER.info(
-                                        "Relogin successful after 429 for config entry %s", config_entry.entry_id
-                                    )
-                                    # Token im config_entry aktualisieren, falls nötig
-                                    self._relogin_429_done = True
-                                except Exception as relogin_err:
-                                    LOGGER.error("Relogin after 429 failed: %s", relogin_err)
-                                    self._relogin_429_done = True  # Auch bei Fehler nicht nochmal versuchen
+                    # if not self._relogin_429_done:
+                    #     config_entry = getattr(self.oauth, "_config_entry", None)
+                    #     if config_entry and "password" in config_entry.data:
+                    #         password = config_entry.data["password"]
+                    #         username = config_entry.data.get("username")
+                    #         if username and password and hasattr(self.oauth, "async_login_new"):
+                    #             LOGGER.info(
+                    #                 "429 detected: Trying relogin with stored password for config_entry: %s",
+                    #                 config_entry.entry_id,
+                    #             )
+                    #             try:
+                    #                 await self.oauth.async_login_new(username, password)
+                    #                 LOGGER.info(
+                    #                     "Relogin successful after 429 for config entry %s", config_entry.entry_id
+                    #                 )
+                    #                 # Token im config_entry aktualisieren, falls nötig
+                    #                 self._relogin_429_done = True
+                    #             except Exception as relogin_err:
+                    #                 LOGGER.error("Relogin after 429 failed: %s", relogin_err)
+                    #                 self._relogin_429_done = True  # Auch bei Fehler nicht nochmal versuchen
 
                 self.ws_connect_retry_counter += 1
                 self.connection_state = STATE_RECONNECTING
@@ -350,6 +346,8 @@ class Websocket:
             except Exception as error:
                 LOGGER.error("Other error %s", error)
                 raise
+
+        LOGGER.warning("_start_websocket_handler: stopping")
 
     async def _websocket_handler(self, session: ClientSession, **kwargs):
         websocket_url = helper.Websocket_url(self._region)
@@ -367,8 +365,17 @@ class Websocket:
         self._initial_timeout_used = True
         self._watchdog.timeout = INITIAL_WATCHDOG_TIMEOUT
 
-        await self._watchdog.trigger()
+        # Reset retry counter and blocked status on successful connection
+        if self.ws_connect_retry_counter > 0:
+            LOGGER.info("WebSocket reconnected successfully, resetting retry counter from %d", self.ws_connect_retry_counter)
+            self.ws_connect_retry_counter = 0
+            self.ws_blocked_connection_error_logged = False
+            if self.account_blocked:
+                LOGGER.info("WebSocket unblocked, marking account as active")
+                self.account_blocked = False
 
+        await self._watchdog.trigger()
+       
         while not self._connection.closed:
             if self.is_stopping:
                 break
@@ -385,6 +392,7 @@ class Websocket:
                 LOGGER.debug("websocket connection is closing - message type error.")
                 break
             if msg.type == WSMsgType.BINARY:
+                LOGGER.debug("websocket message type binary.")
                 self._queue.put_nowait(msg.data)
                 await self._pingwatchdog.trigger()
                 await self._watchdog.trigger()
@@ -399,11 +407,9 @@ class Websocket:
             "X-TrackingId": str(uuid.uuid4()).upper(),
             "ris-os-name": RIS_OS_NAME,
             "ris-os-version": RIS_OS_VERSION,
-            # "ris-websocket-type": "ios-native",
             "ris-sdk-version": RIS_SDK_VERSION,
             "X-Locale": "de-DE",
             "User-Agent": WEBSOCKET_USER_AGENT,
-            # "Accept-Language": " de-DE,de;q=0.9",
         }
 
         return self._get_region_header(header)
@@ -495,7 +501,7 @@ class Websocket:
         current_time = asyncio.get_event_loop().time()
         connection_duration = current_time - self._connection_start_time
 
-        # During protection period (first 4:30), don't allow timeout changes
+        # During protection period (first 10s), don't allow timeout changes
         if connection_duration < WATCHDOG_PROTECTION_PERIOD:
             LOGGER.debug(
                 "Watchdog timeout change blocked during protection period (%.1fs elapsed)", connection_duration
