@@ -352,7 +352,7 @@ class Websocket:
                 LOGGER.error("Other error %s", error)
                 raise
 
-        LOGGER.warning("_start_websocket_handler: stopping")
+        LOGGER.debug("_start_websocket_handler: stopping")
 
     async def _websocket_handler(self, session: ClientSession, **kwargs):
         websocket_url = helper.Websocket_url(self._region)
