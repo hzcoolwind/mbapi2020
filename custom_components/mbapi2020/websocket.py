@@ -289,7 +289,12 @@ class Websocket:
         while not self.is_stopping and not session.closed:
             try:
                 await self.component_reload_watcher.trigger()
+                
+                # raise WSServerHandshakeError(None, None, code=429, message="test")     # test block
+
                 await self._websocket_handler(session)
+
+                
             except client_exceptions.ClientConnectionError as cce:  # noqa: PERF203
                 LOGGER.error("Could not connect: %s, retry in %s seconds...", cce, retry_in)
                 LOGGER.debug(cce)
@@ -317,7 +322,7 @@ class Websocket:
 
                 if "429" in str(error.code):
                     self.account_blocked = True
-
+                    LOGGER.info("429 detected,  Trying relogin or fallback to rest api.")
                     # if not self._relogin_429_done:
                     #     config_entry = getattr(self.oauth, "_config_entry", None)
                     #     if config_entry and "password" in config_entry.data:

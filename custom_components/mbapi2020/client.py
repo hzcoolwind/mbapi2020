@@ -288,6 +288,11 @@ class Client:
         if not update_mode:
             car.last_full_message = received_car_data
 
+         # For REST data, create synthetic windowStatusOverall if missing
+        if is_rest_data and received_car_data.get("attributes"):
+            if "windowStatusOverall" not in received_car_data["attributes"]:
+                self._create_synthetic_window_status_overall(received_car_data, car.finorvin)
+
         car.odometer = self._get_car_values(
             received_car_data,
             car.finorvin,
@@ -344,11 +349,6 @@ class Client:
             update_mode,
         )
         
-        # For REST data, create synthetic windowStatusOverall if missing
-        if is_rest_data and received_car_data.get("attributes"):
-            if "windowStatusOverall" not in received_car_data["attributes"]:
-                self._create_synthetic_window_status_overall(received_car_data, car.finorvin)
-
         car.electric = self._get_car_values(
             received_car_data,
             car.finorvin,
@@ -769,21 +769,22 @@ class Client:
             try:
                 numeric_statuses = [int(status) for status in window_statuses if status is not None]
                 if numeric_statuses:
-                    overall_value = "OPEN" if any(status > 0 for status in numeric_statuses) else "CLOSED"
+                    overall_value = "OPEN" if any(status != 2 for status in numeric_statuses) else "CLOSED"
                 else:
                     overall_value = "CLOSED"  # Default to closed if no valid data
             except (ValueError, TypeError):
                 # If values are not numeric, try string comparison
-                overall_value = "OPEN" if any(str(status).upper() in ["OPEN", "1", "TRUE"] for status in window_statuses) else "CLOSED"
+                overall_value = "CLOSED"
         else:
             # No individual window data available, default to CLOSED
             overall_value = "CLOSED"
         
         # Create the synthetic windowStatusOverall attribute
         car_data["attributes"]["windowStatusOverall"] = {
-            "value": overall_value,
             "timestamp": str(latest_timestamp) if latest_timestamp > 0 else "0",
-            "status": 4  # Use same status as other synthetic attributes
+            "bool_value": overall_value == "CLOSED", 
+            "status": "VALID",  # Use same status as other synthetic attributes
+            "timestamp_in_ms": str(latest_timestamp*1000+223)
         }
 
         LOGGER.debug("Created synthetic windowStatusOverall for %s: %s (based on %d individual windows)", 
